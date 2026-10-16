@@ -7,8 +7,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var statusLabel: NSMenuItem!
     private var toggleItem: NSMenuItem!
+    private var autoReconnectItem: NSMenuItem!
     private var timer: Timer!
     private var serviceID: String?
+    private var userDisconnected = false
+    private var lastReconnectAttempt: Date?
+    private let reconnectCooldown: TimeInterval = 15
+
+    private static let autoReconnectKey = "autoReconnect"
+    private var autoReconnect: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.autoReconnectKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.autoReconnectKey) }
+    }
 
     private enum VPNState {
         case connected
@@ -27,6 +37,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         toggleItem = NSMenuItem(title: "Se connecter", action: #selector(toggleVPN), keyEquivalent: "")
         menu.addItem(toggleItem)
+        autoReconnectItem = NSMenuItem(title: "Reconnexion automatique", action: #selector(toggleAutoReconnect), keyEquivalent: "")
+        autoReconnectItem.state = autoReconnect ? .on : .off
+        menu.addItem(autoReconnectItem)
         menu.addItem(NSMenuItem(title: "Ouvrir Azure VPN Client", action: #selector(openAzureVPN), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Quitter", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -42,10 +55,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Azure VPN Client.app"))
     }
 
-    @objc private func toggleVPN() {
-        guard let serviceID else { return }
-        let action = (queryVPNState().0 == .connected) ? "stop" : "start"
+    @objc private func toggleAutoReconnect() {
+        autoReconnect.toggle()
+        autoReconnectItem.state = autoReconnect ? .on : .off
+        refresh()
+    }
 
+    @objc private func toggleVPN() {
+        let connected = queryVPNState().0 == .connected
+        // Une déconnexion manuelle suspend la reconnexion auto jusqu'à la prochaine connexion manuelle.
+        userDisconnected = connected
+        runNC(connected ? "stop" : "start")
+    }
+
+    private func runNC(_ action: String) {
+        guard let serviceID else { return }
         let task = Process()
         task.executableURL = URL(fileURLWithPath: "/usr/sbin/scutil")
         task.arguments = ["--nc", action, serviceID]
@@ -54,6 +78,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
             self?.refresh()
         }
+    }
+
+    private func reconnectIfNeeded(_ state: VPNState) {
+        guard autoReconnect, !userDisconnected, state == .disconnected, serviceID != nil else { return }
+        if let last = lastReconnectAttempt, Date().timeIntervalSince(last) < reconnectCooldown { return }
+        lastReconnectAttempt = Date()
+        runNC("start")
     }
 
     private func queryVPNState() -> (VPNState, String?) {
@@ -94,6 +125,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refresh() {
         let (state, id) = queryVPNState()
         serviceID = id
+        if state == .connected { lastReconnectAttempt = nil }
+        reconnectIfNeeded(state)
 
         let symbolName: String
         let tint: NSColor
